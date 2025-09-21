@@ -1,0 +1,97 @@
+MODULE cache ;
+  # Singleton cache mapping pattern strings to compiled NFAs.
+  # Supports lookup, insertion, and persistence to disk.
+
+  USES MODULE compile AS C, MODULE std AS std ;
+
+  # ---- TYPES ----
+  TYPE
+    CacheEntry = RECORD
+      pattern : STRING ;
+      nfa     : C.NFA ;
+    ENDRECORD ;
+
+    Cache = ARRAY OF CacheEntry ;
+  ENDTYPE
+
+  # ---- STATE & CONFIG ----
+  VAR
+    cacheList : Cache ;                   # in‐memory cache
+  CONST
+    cacheFile : STRING = "ere_cache.json" ;
+
+  # ---- INITIALIZATION ----
+
+  # Load existing cache from disk, or start empty if none
+  PROC initCache () ;
+  VAR blob : STRING ;
+  BEGIN
+    IF std.FILE_EXISTS(cacheFile) THEN
+      blob      <- std.READ_FILE(cacheFile) ;
+      cacheList <- std.DESERIALIZE(blob) ;
+    ELSE
+      cacheList <- [] : Cache ;
+    FI ;
+  ENDPROC
+
+  # ---- CACHE OPERATIONS ----
+
+  # Lookup a compiled NFA by its pattern. 
+  # Returns TRUE and writes to outNfa if found; else returns FALSE.
+  FUNC lookup (
+    pattern : STRING,
+    VAR outNfa : C.NFA
+  ) -> BOOL ;
+  VAR entry : CacheEntry ;
+  BEGIN
+    FOR EACH entry IN cacheList DO
+      IF entry.pattern = pattern THEN
+        outNfa <- entry.nfa ;
+        RETURN TRUE ;
+      FI ;
+    OD ;
+    RETURN FALSE ;
+  ENDFUNC
+
+  # Store (or update) a compiled NFA under its pattern key.
+  PROC store (
+    pattern : STRING,
+    nfa     : C.NFA
+  ) ;
+  VAR
+    i        : U32 ;
+    entry    : CacheEntry ;
+    found    : BOOL ;
+  BEGIN
+    found <- FALSE ;
+    # Update existing entry if present
+    FOR i IN 0u .. std.LENGTH(cacheList)-1u DO
+      IF cacheList[i].pattern = pattern THEN
+        cacheList[i].nfa <- nfa ;
+        found <- TRUE ;
+        BREAK ;
+      FI ;
+    OD ;
+    # Otherwise append new entry
+    IF NOT found THEN
+      entry.pattern <- pattern ;
+      entry.nfa     <- nfa ;
+      cacheList     <- APPEND(cacheList, entry) ;
+    FI ;
+  ENDPROC
+
+  # ---- PERSISTENCE ----
+
+  # Write current cacheList to disk as serialized JSON
+  PROC saveCache () ;
+  VAR blob : STRING ;
+  BEGIN
+    blob <- std.SERIALIZE(cacheList) ;
+    std.WRITE_FILE(cacheFile, blob) ;
+  ENDPROC
+
+  # ---- EXPORTS ----
+  EXPORT initCache, lookup, store, saveCache ;
+
+ENDMODULE ;
+

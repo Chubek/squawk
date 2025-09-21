@@ -1,0 +1,197 @@
+(* cache.sudl *)
+(* Module for caching compiled ERE NFAs to improve performance *)
+
+MODULE "cache.sudl"
+
+USES "MODULE" "common.sudl" AS Common;
+USES "MODULE" "compile.sudl" AS Compile;
+
+(* === Cache Configuration === *)
+CONST
+    CACHE_SIZE = 101; (* A prime number is often chosen for better distribution in hash tables *)
+
+(* === Cache Data Structures === *)
+
+(* An entry in the cache, representing one compiled regex *)
+TYPE CacheEntry = RECORD {
+    pattern: ^U8; (* The original regex string. Owned by this entry. *)
+    pattern_length: I32; (* Length of the pattern string *)
+    nfa: ^Compile.NFA; (* The compiled NFA. Owned by this entry. *)
+    next: ^CacheEntry; (* Pointer for chaining in case of hash collisions *)
+}
+
+(* The cache itself, a simple hash table *)
+TYPE RegexCache = RECORD {
+    buckets: ARRAY[CACHE_SIZE] OF ^CacheEntry; (* Array of pointers to the head of each chain *)
+    initialized: BOOLEAN; (* Flag to check if cache is set up *)
+}
+
+(* === Global Cache Instance === *)
+(* In a more complex system, this might be a parameter or part of a larger context *)
+VAR g_cache: RegexCache;
+
+(* === Cache API Functions === *)
+
+(* Initializes the global regex cache *)
+PROC InitializeCache() -> BOOLEAN;
+VAR i: I32;
+BEGIN
+    IF g_cache.initialized THEN RETURN TRUE; ENDIF; (* Already initialized *)
+    
+    FOR i := 0 TO CACHE_SIZE - 1 DO
+        g_cache.buckets[i] := NIL;
+    ENDFOR;
+    
+    g_cache.initialized := TRUE;
+    RETURN TRUE;
+ENDPROC;
+
+(* Retrieves a compiled NFA from the cache *)
+(* Returns NIL if not found, signaling the caller to compile it *)
+(* The caller does not own the returned NFA pointer *)
+PROC GetCompiledNFA(pattern: ^U8, pattern_length: I32) -> ^Compile.NFA;
+VAR
+    hash_val: I32;
+    entry: ^CacheEntry;
+BEGIN
+    IF NOT g_cache.initialized THEN RETURN NIL; ENDIF;
+    
+    hash_val := hash_string(pattern, pattern_length) MOD CACHE_SIZE;
+    entry := g_cache.buckets[hash_val];
+    
+    (* Traverse the chain to find the pattern *)
+    WHILE entry # NIL DO
+        IF entry.pattern_length = pattern_length AND
+           strings_equal(entry.pattern, pattern, pattern_length) THEN
+            RETURN entry.nfa;
+        ENDIF;
+        entry := entry.next;
+    ENDWHILE;
+    
+    (* Not found in cache *)
+    RETURN NIL;
+ENDPROC;
+
+(* Adds a newly compiled NFA to the cache *)
+(* The cache takes ownership of the 'nfa' pointer and the 'pattern' string *)
+(* The caller should not use 'pattern' or 'nfa' after calling this *)
+PROC PutCompiledNFA(pattern: ^U8, pattern_length: I32, nfa: ^Compile.NFA) -> BOOLEAN;
+VAR
+    hash_val: I32;
+    entry: ^CacheEntry;
+    new_pattern: ^U8;
+BEGIN
+    IF NOT g_cache.initialized OR pattern = NIL OR nfa = NIL THEN RETURN FALSE; ENDIF;
+    
+    (* Check if it's already in the cache to avoid duplicates *)
+    (* This might be redundant if the caller is careful, but it's safer *)
+    IF GetCompiledNFA(pattern, pattern_length) # NIL THEN
+        (* It's already there, don't add again. Caller should have checked. *)
+        (* We still take ownership and must free the new NFA *)
+        Compile.FreeNFA(nfa);
+        RETURN FALSE;
+    ENDIF;
+    
+    (* Allocate and populate a new cache entry *)
+    ALLOCATE(entry, 1);
+    IF entry = NIL THEN
+        (* Allocation failed, free the NFA we were given and return failure *)
+        Compile.FreeNFA(nfa);
+        RETURN FALSE;
+    ENDIF;
+    
+    (* Copy the pattern string *)
+    ALLOCATE(new_pattern, pattern_length + 1); (* +1 for null terminator *)
+    IF new_pattern = NIL THEN
+        FREE(entry);
+        Compile.FreeNFA(nfa);
+        RETURN FALSE;
+    ENDIF;
+    copy_string(new_pattern, pattern, pattern_length);
+    new_pattern[pattern_length] := 0; (* Null terminate *)
+    
+    entry.pattern := new_pattern;
+    entry.pattern_length := pattern_length;
+    entry.nfa := nfa;
+    entry.next := NIL;
+    
+    (* Add to the hash table *)
+    hash_val := hash_string(pattern, pattern_length) MOD CACHE_SIZE;
+    entry.next := g_cache.buckets[hash_val];
+    g_cache.buckets[hash_val] := entry;
+    
+    RETURN TRUE;
+ENDPROC;
+
+(* Destroys the entire cache, freeing all memory *)
+PROC DestroyCache();
+VAR
+    i: I32;
+    entry: ^CacheEntry;
+    next_entry: ^CacheEntry;
+BEGIN
+    IF NOT g_cache.initialized THEN RETURN; ENDIF;
+    
+    FOR i := 0 TO CACHE_SIZE - 1 DO
+        entry := g_cache.buckets[i];
+        WHILE entry # NIL DO
+            next_entry := entry.next;
+            
+            (* Free the pattern string *)
+            IF entry.pattern # NIL THEN
+                FREE(entry.pattern);
+            ENDIF;
+            
+            (* Free the NFA *)
+            IF entry.nfa # NIL THEN
+                Compile.FreeNFA(entry.nfa);
+            ENDIF;
+            
+            (* Free the entry itself *)
+            FREE(entry);
+            
+            entry := next_entry;
+        ENDWHILE;
+        g_cache.buckets[i] := NIL;
+    ENDFOR;
+    
+    g_cache.initialized := FALSE;
+ENDPROC;
+
+(* === Internal Helper Functions === *)
+
+(* A simple hash function for a string *)
+(* djb2 hash algorithm *)
+PROC hash_string(str: ^U8, len: I32) -> I32;
+VAR
+    hash: I32;
+    i: I32;
+BEGIN
+    hash := 5381;
+    FOR i := 0 TO len - 1 DO
+        hash := ((hash SHL 5) + hash) + str[i]; (* hash * 33 + c *)
+    ENDFOR;
+    RETURN hash;
+ENDPROC;
+
+(* Compares two strings for equality *)
+PROC strings_equal(str1: ^U8, str2: ^U8, len: I32) -> BOOLEAN;
+VAR i: I32;
+BEGIN
+    FOR i := 0 TO len - 1 DO
+        IF str1[i] # str2[i] THEN RETURN FALSE; ENDIF;
+    ENDFOR;
+    RETURN TRUE;
+ENDPROC;
+
+(* Copies a string from src to dst up to len characters *)
+PROC copy_string(dst: ^U8, src: ^U8, len: I32);
+VAR i: I32;
+BEGIN
+    FOR i := 0 TO len - 1 DO
+        dst[i] := src[i];
+    ENDFOR;
+ENDPROC;
+
+ENDMODULE;
+

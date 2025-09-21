@@ -1,0 +1,486 @@
+(* compile.sudl *)
+(* Module for compiling an ERE AST into an NFA using Thompson's Construction *)
+
+MODULE "compile.sudl"
+
+USES "MODULE" "common.sudl" AS Common;
+USES "MODULE" "parse.sudl" AS Parse;
+
+(* === NFA Representation === *)
+
+CONST
+    EPSILON = 0;
+    CHAR_TRANSITION = 1;
+    DOT_TRANSITION = 2; (* Represents '.' transition *)
+
+TYPE TransitionType = I32;
+
+(* A single transition from one state to another *)
+TYPE Transition = RECORD {
+    from_state: I32;
+    to_state: I32;
+    type: TransitionType; (* EPSILON, CHAR_TRANSITION, DOT_TRANSITION *)
+    char: U32; (* Used when type is CHAR_TRANSITION *)
+}
+
+(* The NFA structure *)
+TYPE NFA = RECORD {
+    states: ARRAY[1024] OF BOOLEAN; (* Simple bitmap to track used states, indexed by state ID *)
+    transitions: ARRAY[2048] OF Transition; (* List of all transitions *)
+    num_transitions: I32;
+    start_state: I32;
+    accept_states: ARRAY[64] OF I32; (* List of accepting states *)
+    num_accept_states: I32;
+    num_states: I32; (* Total number of states created *)
+}
+
+(* === Compiler State === *)
+(* Internal state for the compiler to manage unique state IDs *)
+TYPE CompilerState = RECORD {
+    nfa: ^NFA;
+    next_state_id: I32;
+    error: BOOLEAN;
+    error_msg: ARRAY[256] OF U8;
+}
+
+(* === Core Compilation Functions === *)
+
+(* Main compilation function *)
+(* Takes an AST and returns a pointer to a compiled NFA *)
+PROC CompileERE(ast: ^Parse.ASTNode) -> ^NFA;
+VAR
+    compiler_state: CompilerState;
+    nfa_ptr: ^NFA;
+    start_id: I32;
+    accept_id: I32;
+BEGIN
+    (* Allocate memory for the NFA *)
+    ALLOCATE(nfa_ptr, 1);
+    IF nfa_ptr = NIL THEN
+        (* Handle allocation failure *)
+        RETURN NIL;
+    ENDIF;
+    
+    (* Initialize NFA *)
+    FOR i := 0 TO 1023 DO
+        nfa_ptr.states[i] := FALSE;
+    ENDFOR;
+    nfa_ptr.num_transitions := 0;
+    nfa_ptr.num_accept_states := 0;
+    nfa_ptr.num_states := 0;
+    
+    (* Initialize compiler state *)
+    compiler_state.nfa := nfa_ptr;
+    compiler_state.next_state_id := 0;
+    compiler_state.error := FALSE;
+    FOR i := 0 TO 255 DO
+        compiler_state.error_msg[i] := 0;
+    ENDFOR;
+    
+    (* Create initial start and accept states for the entire NFA *)
+    start_id := new_state(compiler_state);
+    accept_id := new_state(compiler_state);
+    
+    nfa_ptr.start_state := start_id;
+    
+    (* Compile the AST. The result will be the start and accept IDs of the sub-NFA *)
+    VAR sub_start: I32; VAR sub_accept: I32;
+    compile_node(compiler_state, ast, sub_start, sub_accept);
+    
+    IF compiler_state.error THEN
+        FREE(nfa_ptr);
+        RETURN NIL;
+    ENDIF;
+    
+    (* Connect the initial start state to the sub-NFA's start state *)
+    add_epsilon_transition(compiler_state, start_id, sub_start);
+    (* Connect the sub-NFA's accept state to our final accept state *)
+    add_epsilon_transition(compiler_state, sub_accept, accept_id);
+    
+    (* Mark the final accept state *)
+    IF nfa_ptr.num_accept_states < 64 THEN
+        nfa_ptr.accept_states[nfa_ptr.num_accept_states] := accept_id;
+        nfa_ptr.num_accept_states := nfa_ptr.num_accept_states + 1;
+        nfa_ptr.states[accept_id] := TRUE; (* Mark state as used *)
+    ENDIF;
+    
+    RETURN nfa_ptr;
+ENDPROC;
+
+(* Recursive function to compile an AST node into NFA fragment *)
+(* It returns the start and accept state IDs of the generated fragment *)
+PROC compile_node(VAR state: CompilerState, node: ^Parse.ASTNode, VAR start_id: I32, VAR accept_id: I32);
+BEGIN
+    IF state.error OR node = NIL THEN RETURN; ENDIF;
+    
+    CASE node.type OF
+        Common.CHAR_NODE:
+            compile_char_node(state, CAST<^Parse.CharNode>(node), start_id, accept_id);
+        Common.DOT_NODE:
+            compile_dot_node(state, CAST<^Parse.DotNode>(node), start_id, accept_id);
+        Common.ESCAPE_NODE:
+            compile_escape_node(state, CAST<^Parse.EscapeNode>(node), start_id, accept_id);
+        Common.CONCAT_NODE:
+            compile_concat_node(state, CAST<^Parse.ConcatNode>(node), start_id, accept_id);
+        Common.ALTERNATION_NODE:
+            compile_alternation_node(state, CAST<^Parse.AlternationNode>(node), start_id, accept_id);
+        Common.KLEENE_NODE:
+            compile_kleene_node(state, CAST<^Parse.KleeneNode>(node), start_id, accept_id);
+        Common.PLUS_NODE:
+            compile_plus_node(state, CAST<^Parse.PlusNode>(node), start_id, accept_id);
+        Common.QUESTION_NODE:
+            compile_question_node(state, CAST<^Parse.QuestionNode>(node), start_id, accept_id);
+        Common.BOUNDARY_NODE:
+            compile_boundary_node(state, CAST<^Parse.BoundaryNode>(node), start_id, accept_id);
+        Common.GROUP_NODE:
+            (* For compilation, a group is just its contents *)
+            compile_node(state, CAST<^Parse.GroupNode>(node).base.child, start_id, accept_id);
+        Common.BRACKET_NODE:
+            compile_bracket_node(state, CAST<^Parse.BracketNode>(node), start_id, accept_id);
+        OTHERWISE:
+            set_compile_error(state, "Unknown AST node type during compilation");
+    ENDCASE;
+ENDPROC;
+
+(* === Thompson's Construction for Individual Nodes === *)
+
+(* --- Character Node --- *)
+PROC compile_char_node(VAR state: CompilerState, node: ^Parse.CharNode, VAR start_id: I32, VAR accept_id: I32);
+BEGIN
+    start_id := new_state(state);
+    accept_id := new_state(state);
+    add_char_transition(state, start_id, accept_id, node.base.char);
+ENDPROC;
+
+(* --- Dot Node --- *)
+PROC compile_dot_node(VAR state: CompilerState, node: ^Parse.DotNode, VAR start_id: I32, VAR accept_id: I32);
+BEGIN
+    start_id := new_state(state);
+    accept_id := new_state(state);
+    add_dot_transition(state, start_id, accept_id);
+ENDPROC;
+
+(* --- Escape Node --- *)
+(* Treated the same as a character node for compilation *)
+PROC compile_escape_node(VAR state: CompilerState, node: ^Parse.EscapeNode, VAR start_id: I32, VAR accept_id: I32);
+BEGIN
+    start_id := new_state(state);
+    accept_id := new_state(state);
+    add_char_transition(state, start_id, accept_id, node.base.sequence);
+ENDPROC;
+
+(* --- Concatenation Node --- *)
+PROC compile_concat_node(VAR state: CompilerState, node: ^Parse.ConcatNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    left_start: I32; VAR left_accept: I32;
+    right_start: I32; VAR right_accept: I32;
+BEGIN
+    compile_node(state, node.base.left, left_start, left_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    compile_node(state, node.base.right, right_start, right_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    (* The start of the concat is the start of the left part *)
+    start_id := left_start;
+    (* The accept of the concat is the accept of the right part *)
+    accept_id := right_accept;
+    
+    (* Connect the accept of the left part to the start of the right part *)
+    add_epsilon_transition(state, left_accept, right_start);
+ENDPROC;
+
+(* --- Alternation Node (|) --- *)
+PROC compile_alternation_node(VAR state: CompilerState, node: ^Parse.AlternationNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    left_start: I32; VAR left_accept: I32;
+    right_start: I32; VAR right_accept: I32;
+    new_start: I32; VAR new_accept: I32;
+BEGIN
+    new_start := new_state(state);
+    new_accept := new_state(state);
+    
+    compile_node(state, node.base.left, left_start, left_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    compile_node(state, node.base.right, right_start, right_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    start_id := new_start;
+    accept_id := new_accept;
+    
+    (* Epsilon transitions from new start to both left and right starts *)
+    add_epsilon_transition(state, new_start, left_start);
+    add_epsilon_transition(state, new_start, right_start);
+    
+    (* Epsilon transitions from both left and right accepts to new accept *)
+    add_epsilon_transition(state, left_accept, new_accept);
+    add_epsilon_transition(state, right_accept, new_accept);
+ENDPROC;
+
+(* --- Kleene Star (*) --- *)
+PROC compile_kleene_node(VAR state: CompilerState, node: ^Parse.KleeneNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    child_start: I32; VAR child_accept: I32;
+    new_start: I32; VAR new_accept: I32;
+BEGIN
+    new_start := new_state(state);
+    new_accept := new_state(state);
+    
+    compile_node(state, node.base.base.child, child_start, child_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    start_id := new_start;
+    accept_id := new_accept;
+    
+    (* Epsilon transitions for the star *)
+    add_epsilon_transition(state, new_start, child_start); (* Start -> Child Start *)
+    add_epsilon_transition(state, child_accept, child_start); (* Child Accept -> Child Start (loop) *)
+    add_epsilon_transition(state, new_start, new_accept); (* Start -> Accept (for zero matches) *)
+    add_epsilon_transition(state, child_accept, new_accept); (* Child Accept -> Accept *)
+ENDPROC;
+
+(* --- Plus (+) --- *)
+PROC compile_plus_node(VAR state: CompilerState, node: ^Parse.PlusNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    child_start: I32; VAR child_accept: I32;
+    new_start: I32; VAR new_accept: I32;
+BEGIN
+    new_start := new_state(state);
+    new_accept := new_state(state);
+    
+    compile_node(state, node.base.base.child, child_start, child_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    start_id := new_start;
+    accept_id := new_accept;
+    
+    (* Epsilon transitions for the plus *)
+    add_epsilon_transition(state, new_start, child_start); (* Start -> Child Start *)
+    add_epsilon_transition(state, child_accept, child_start); (* Child Accept -> Child Start (loop) *)
+    add_epsilon_transition(state, child_accept, new_accept); (* Child Accept -> Accept *)
+    (* Note: No direct path from new_start to new_accept, enforcing at least one match *)
+ENDPROC;
+
+(* --- Question Mark (?) --- *)
+PROC compile_question_node(VAR state: CompilerState, node: ^Parse.QuestionNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    child_start: I32; VAR child_accept: I32;
+    new_start: I32; VAR new_accept: I32;
+BEGIN
+    new_start := new_state(state);
+    new_accept := new_state(state);
+    
+    compile_node(state, node.base.base.child, child_start, child_accept);
+    IF state.error THEN RETURN; ENDIF;
+    
+    start_id := new_start;
+    accept_id := new_accept;
+    
+    (* Epsilon transitions for the question mark *)
+    add_epsilon_transition(state, new_start, child_start); (* Start -> Child Start *)
+    add_epsilon_transition(state, new_start, new_accept); (* Start -> Accept (for zero matches) *)
+    add_epsilon_transition(state, child_accept, new_accept); (* Child Accept -> Accept *)
+ENDPROC;
+
+(* --- Boundary Node {m,n} --- *)
+(* This is a simplified implementation. A full implementation would be more complex. *)
+(* For now, we'll handle a few common cases or treat it as a fixed repetition. *)
+(* A more robust implementation would involve creating chains of NFAs. *)
+PROC compile_boundary_node(VAR state: CompilerState, node: ^Parse.BoundaryNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    i: I32;
+    current_start: I32; VAR current_accept: I32;
+    next_start: I32; VAR next_accept: I32;
+    temp_start: I32; VAR temp_accept: I32;
+    alt_start: I32; VAR alt_accept: I32;
+BEGIN
+    (* This is a complex case. Let's handle a simple one: {n} (exactly n) *)
+    (* For {m,n}, we'd need to create a more complex structure involving concatenations and alternations *)
+    (* This example shows the pattern for {2} *)
+    
+    IF node.base.min = node.base.max AND node.base.min >= 0 THEN
+        (* Case {n}: Concatenate n copies of the child *)
+        IF node.base.min = 0 THEN
+            (* {0} is like epsilon *)
+            start_id := new_state(state);
+            accept_id := new_state(state);
+            add_epsilon_transition(state, start_id, accept_id);
+            RETURN;
+        ENDIF;
+        
+        compile_node(state, node.base.base.child, current_start, current_accept);
+        IF state.error THEN RETURN; ENDIF;
+        
+        FOR i := 1 TO node.base.min - 1 DO
+            compile_node(state, node.base.base.child, next_start, next_accept);
+            IF state.error THEN RETURN; ENDIF;
+            
+            add_epsilon_transition(state, current_accept, next_start);
+            current_accept := next_accept; (* Chain them *)
+        ENDFOR;
+        
+        start_id := current_start;
+        accept_id := current_accept;
+    ELSE
+        (* Simplified handling: treat as {0,1} or {1,} based on min/max *)
+        (* This is a significant simplification *)
+        IF node.base.min = 0 AND node.base.max = 1 THEN
+            (* Treat as ? *)
+            compile_question_node(state, CAST<^Parse.QuestionNode>(CAST<^Parse.ASTNode>(node)), start_id, accept_id);
+        ELSIF node.base.min = 1 AND node.base.max = -1 THEN
+            (* Treat as + *)
+            compile_plus_node(state, CAST<^Parse.PlusNode>(CAST<^Parse.ASTNode>(node)), start_id, accept_id);
+        ELSE
+            (* Default to * for unhandled complex cases, or raise an error *)
+            set_compile_error(state, "Complex boundary quantifiers {m,n} not fully implemented");
+            (* Fallback to * *)
+            VAR temp_node: Parse.KleeneNode;
+            temp_node.base.base.base.type := Common.KLEENE_NODE;
+            temp_node.base.base.child := node.base.base.child;
+            temp_node.base.base.greedy := node.base.base.greedy;
+            compile_kleene_node(state, temp_node, start_id, accept_id);
+        ENDIF;
+    ENDIF;
+ENDPROC;
+
+(* --- Bracket Node [...] --- *)
+PROC compile_bracket_node(VAR state: CompilerState, node: ^Parse.BracketNode, VAR start_id: I32, VAR accept_id: I32);
+VAR
+    i: I32;
+    alt_start: I32; VAR alt_accept: I32;
+    char_start: I32; VAR char_accept: I32;
+    range_start: I32; VAR range_accept: I32;
+    new_start: I32; VAR new_accept: I32;
+BEGIN
+    new_start := new_state(state);
+    new_accept := new_state(state);
+    start_id := new_start;
+    accept_id := new_accept;
+    
+    (* Create alternations for all characters and ranges *)
+    (* This is a simplified approach, creating a big alternation *)
+    (* A more efficient NFA might have a single state with multiple transitions *)
+    
+    (* Handle individual characters *)
+    FOR i := 0 TO node.base.char_count - 1 DO
+        char_start := new_state(state);
+        char_accept := new_state(state);
+        add_char_transition(state, char_start, char_accept, node.base.chars[i]);
+        add_epsilon_transition(state, new_start, char_start);
+        add_epsilon_transition(state, char_accept, new_accept);
+    ENDFOR;
+    
+    (* Handle ranges *)
+    FOR i := 0 TO node.base.range_count - 1 DO
+        (* Create a special "range" transition type or a series of char transitions *)
+        (* For simplicity, we'll add a transition for each character in the range *)
+        (* Note: This can be very inefficient for large ranges like [0-9A-Za-z] *)
+        (* A real implementation might have a more sophisticated transition type *)
+        VAR c: U32;
+        c := node.base.ranges[i].start;
+        WHILE c <= node.base.ranges[i].end DO
+            range_start := new_state(state);
+            range_accept := new_state(state);
+            add_char_transition(state, range_start, range_accept, c);
+            add_epsilon_transition(state, new_start, range_start);
+            add_epsilon_transition(state, range_accept, new_accept);
+            c := c + 1;
+        ENDWHILE;
+    ENDFOR;
+    
+    (* Negation is complex to handle in an NFA and is often handled during matching *)
+    (* For now, we compile the positive set. Matching logic will need to invert it *)
+    IF node.base.negated THEN
+        (* This is a placeholder. The NFA itself doesn't easily represent negation *)
+        (* The matching algorithm will have to handle [^...] specially *)
+        (* We could add a flag to the NFA or transition to indicate negation *)
+        (* For Thompson's construction, it's easier to handle at match time *)
+        (* We will mark this in a comment or a special transition type if needed *)
+    ENDIF;
+ENDPROC;
+
+(* === Utility Functions for NFA Construction === *)
+
+(* Generates a new unique state ID *)
+PROC new_state(VAR state: CompilerState) -> I32;
+VAR id: I32;
+BEGIN
+    id := state.next_state_id;
+    state.next_state_id := state.next_state_id + 1;
+    IF id < 1024 THEN
+        state.nfa.states[id] := TRUE;
+    ENDIF;
+    state.nfa.num_states := state.nfa.num_states + 1;
+    RETURN id;
+ENDPROC;
+
+(* Adds an epsilon transition *)
+PROC add_epsilon_transition(VAR state: CompilerState, from: I32, to: I32);
+VAR trans: ^Transition;
+BEGIN
+    IF state.nfa.num_transitions >= 2048 THEN
+        set_compile_error(state, "NFA transition limit exceeded");
+        RETURN;
+    ENDIF;
+    trans := @state.nfa.transitions[state.nfa.num_transitions];
+    trans.from_state := from;
+    trans.to_state := to;
+    trans.type := EPSILON;
+    state.nfa.num_transitions := state.nfa.num_transitions + 1;
+ENDPROC;
+
+(* Adds a character transition *)
+PROC add_char_transition(VAR state: CompilerState, from: I32, to: I32, ch: U32);
+VAR trans: ^Transition;
+BEGIN
+    IF state.nfa.num_transitions >= 2048 THEN
+        set_compile_error(state, "NFA transition limit exceeded");
+        RETURN;
+    ENDIF;
+    trans := @state.nfa.transitions[state.nfa.num_transitions];
+    trans.from_state := from;
+    trans.to_state := to;
+    trans.type := CHAR_TRANSITION;
+    trans.char := ch;
+    state.nfa.num_transitions := state.nfa.num_transitions + 1;
+ENDPROC;
+
+(* Adds a dot (any character) transition *)
+PROC add_dot_transition(VAR state: CompilerState, from: I32, to: I32);
+VAR trans: ^Transition;
+BEGIN
+    IF state.nfa.num_transitions >= 2048 THEN
+        set_compile_error(state, "NFA transition limit exceeded");
+        RETURN;
+    ENDIF;
+    trans := @state.nfa.transitions[state.nfa.num_transitions];
+    trans.from_state := from;
+    trans.to_state := to;
+    trans.type := DOT_TRANSITION;
+    state.nfa.num_transitions := state.nfa.num_transitions + 1;
+ENDPROC;
+
+(* Sets a compilation error *)
+PROC set_compile_error(VAR state: CompilerState, msg: ARRAY[*] OF U8);
+VAR i: I32;
+BEGIN
+    state.error := TRUE;
+    i := 0;
+    WHILE i < 255 AND msg[i] # 0 DO
+        state.error_msg[i] := msg[i];
+        i := i + 1;
+    ENDWHILE;
+    state.error_msg[i] := 0;
+ENDPROC;
+
+(* Function to free an NFA *)
+PROC FreeNFA(nfa: ^NFA);
+BEGIN
+    IF nfa # NIL THEN
+        FREE(nfa);
+    ENDIF;
+ENDPROC;
+
+ENDMODULE;
+

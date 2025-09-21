@@ -1,0 +1,39 @@
+(* common.sudl *)
+(* Common definitions for the ERE implementation *)
+
+MODULE "common.sudl"
+
+(* Node types for the AST *)
+CONST
+    CHAR_NODE = 1;
+    DOT_NODE = 2;
+    ESCAPE_NODE = 3;
+    CONCAT_NODE = 4;
+    ALTERNATION_NODE = 5;
+    KLEENE_NODE = 6;
+    PLUS_NODE = 7;
+    QUESTION_NODE = 8;
+    BOUNDARY_NODE = 9;
+    GROUP_NODE = 10;
+    BRACKET_NODE = 11;
+
+(* Character classes for bracket expressions *)
+CONST
+    CLASS_ALNUM = 1;
+    CLASS_ALPHA = 2;
+    CLASS_BLANK = 3;
+    CLASS_CNTRL = 4;
+    CLASS_DIGIT = 5;
+    CLASS_GRAPH = 6;
+    CLASS_LOWER = 7;
+    CLASS_PRINT = 8;
+    CLASS_PUNCT = 9;
+    CLASS_SPACE = 10;
+    CLASS_UPPER = 11;
+    CLASS_XDIGIT = 12;
+
+TYPE NodeType = I32;
+TYPE CharClass = I32;
+
+ENDMODULE;
+

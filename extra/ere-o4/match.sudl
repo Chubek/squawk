@@ -1,0 +1,223 @@
+MODULE match ;
+  # NFA‐simulation ("subset construction") based matcher for POSIX EREs.
+  # Finds all leftmost‐longest, non‐overlapping matches in a text.
+
+  USES MODULE compile AS C, MODULE cache AS K, MODULE std AS std ;
+
+  # ---- TYPES ----
+
+  TYPE
+    # A set of NFA states, represented as a dynamic array of unique U32 IDs
+    StateSet = ARRAY OF U32 ;
+
+    # A single match result: starting index and length
+    Match = RECORD
+      start  : U32 ;
+      length : U32 ;
+    ENDRECORD ;
+  ENDTYPE
+
+  # ---- HELPERS FOR STATE SETS ----
+
+  # Add state 's' to 'ss' if not already present
+  PROC stateSetAdd (
+    VAR ss : StateSet,
+        s  : U32
+  ) ;
+  VAR i : U32 ;
+  BEGIN
+    FOR i IN 0u .. std.LENGTH(ss)-1u DO
+      IF ss[i] = s THEN
+        RETURN ;   # already in set
+      FI ;
+    OD ;
+    ss <- APPEND(ss, s) ;
+  ENDPROC
+
+  # Check membership of 's' in 'ss'
+  FUNC stateSetContains (
+    ss : StateSet,
+    s  : U32
+  ) -> BOOL ;
+  VAR i : U32 ;
+  BEGIN
+    FOR i IN 0u .. std.LENGTH(ss)-1u DO
+      IF ss[i] = s THEN
+        RETURN TRUE ;
+      FI ;
+    OD ;
+    RETURN FALSE ;
+  ENDFUNC
+
+  # ---- EPSILON‐CLOSURE ----
+
+  # Given an NFA and an initial set of states, return the ε‐closure
+  FUNC epsilonClosure (
+    states : StateSet,
+    nfa    : C.NFA
+  ) -> StateSet ;
+  VAR
+    closure : StateSet ;
+    stack   : StateSet ;
+    cur     : U32 ;
+    t       : C.Transition ;
+    i, top  : U32 ;
+  BEGIN
+    # initialize
+    closure <- states ;
+    stack   <- states ;
+
+    # process until stack empty
+    WHILE std.LENGTH(stack) > 0u DO
+      # pop last
+      top      <- std.LENGTH(stack) - 1u ;
+      cur      <- stack[top] ;
+      stack    <- stack[0u .. top-1u] ;
+
+      # for each ε‐transition out of 'cur'
+      FOR EACH t IN nfa.transitions DO
+        IF t.from = cur AND t.on IS C.SEps() THEN
+          IF NOT stateSetContains(closure, t.to) THEN
+            stateSetAdd(closure, t.to) ;
+            stateSetAdd(stack,   t.to) ;
+          FI ;
+        FI ;
+      OD ;
+    OD ;
+
+    RETURN closure ;
+  ENDFUNC
+
+  # ---- MOVE ON A CHARACTER ----
+
+  # From a set of states, follow all symbol‐labeled transitions matching 'c'
+  FUNC moveOnChar (
+    states : StateSet,
+    c      : CHAR,
+    nfa    : C.NFA
+  ) -> StateSet ;
+  VAR
+    next    : StateSet ;
+    t       : C.Transition ;
+    i       : U32 ;
+  BEGIN
+    next <- [] : StateSet ;
+    FOR EACH t IN nfa.transitions DO
+      # if transition is from a state in 'states'
+      IF stateSetContains(states, t.from) THEN
+        CASE t.on OF
+          | C.SC(x) =>
+              IF x = c THEN stateSetAdd(next, t.to) FI ;
+          | C.SAny() =>
+              # wildcard matches any single character
+              stateSetAdd(next, t.to) ;
+          | C.SEps() =>
+              # do nothing on ε here
+              ;
+        ENDCASE ;
+      FI ;
+    OD ;
+    RETURN next ;
+  ENDFUNC
+
+  # ---- MATCH A SINGLE POSITION ----
+
+  # Attempt to match the NFA against text starting at 'pos'.
+  # Returns length of longest leftmost match ≥ 0, or returns -1u if no match.
+  FUNC matchAt (
+    nfa   : C.NFA,
+    text  : STRING,
+    pos   : U32
+  ) -> S32 ;
+  VAR
+    currStates   : StateSet ;
+    nextStates   : StateSet ;
+    closed       : StateSet ;
+    bestEnd      : S32 ;
+    i, textLen   : U32 ;
+    c            : CHAR ;
+  BEGIN
+    textLen   <- std.LENGTH(text) ;
+    bestEnd   <- -1s ;
+
+    # 1) start from ε‐closure of the NFA's start state
+    currStates <- [nfa.start] : StateSet ;
+    currStates <- epsilonClosure(currStates, nfa) ;
+
+    # 2) at each input position (including position after last char)
+    FOR i IN pos .. textLen DO
+      # if accept state is in currStates, record longest match so far
+      IF stateSetContains(currStates, nfa.accept) THEN
+        bestEnd <- S32(i) ;
+      FI ;
+
+      # if we've consumed all chars, break
+      IF i = textLen THEN
+        BREAK ;
+      FI ;
+
+      # consume one character
+      c <- text[i] ;
+      nextStates <- moveOnChar(currStates, c, nfa) ;
+      # then close under ε
+      closed     <- epsilonClosure(nextStates, nfa) ;
+      currStates <- closed ;
+    OD ;
+
+    RETURN bestEnd - S32(pos) ;  # -1 indicates no match
+  ENDFUNC
+
+  # ---- FIND ALL MATCHES ----
+
+  # Given a pattern and input text, return all non‐overlapping leftmost‐longest matches.
+  FUNC matchAll (
+    pattern : STRING,
+    text    : STRING
+  ) -> ARRAY OF Match ;
+  VAR
+    results   : ARRAY OF Match ;
+    nfa       : C.NFA ;
+    ok        : BOOL ;
+    pos       : U32 ;
+    textLen   : U32 ;
+    mlen      : S32 ;
+    entry     : Match ;
+  BEGIN
+    # 1) initialize & fetch/compile NFA
+    K.initCache() ;
+    ok <- K.lookup(pattern, nfa) ;
+    IF NOT ok THEN
+      nfa <- C.buildNFA(parse.parseERE(pattern)) ;
+      K.store(pattern, nfa) ;
+      K.saveCache() ;
+    FI ;
+
+    # 2) scan for matches
+    textLen <- std.LENGTH(text) ;
+    pos     <- 0u ;
+    results <- [] : ARRAY OF Match ;
+
+    WHILE pos <= textLen DO
+      mlen <- matchAt(nfa, text, pos) ;
+      IF mlen >= 0s THEN
+        entry.start  <- pos ;
+        entry.length <- U32(mlen) ;
+        results      <- APPEND(results, entry) ;
+        IF mlen > 0s THEN
+          pos <- pos + U32(mlen) ;
+        ELSE
+          # zero‐length match: advance by one to avoid infinite loop
+          pos <- pos + 1u ;
+        FI ;
+      ELSE
+        pos <- pos + 1u ;
+      FI ;
+    OD ;
+
+    RETURN results ;
+  ENDFUNC
+
+  EXPORT matchAll ;
+
+ENDMODULE ;
+
