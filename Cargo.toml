@@ -1,0 +1,39 @@
+[package]
+name = "Squawk"
+description = "Impelementation of Awk in Rust"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+# Error handling
+thiserror = "1.0"        # Derive macro for error types
+anyhow = "1.0"          # Error context and backtraces
+
+# Data structures  
+indexmap = "2.0"        # Order-preserving HashMap for AWK arrays
+smallvec = "1.11"       # Stack-allocated vectors for small collections
+once_cell = "1.18"      # Lazy initialization for caches
+
+# Unicode handling
+unicode-segmentation = "1.10"  # Grapheme cluster iteration
+unicode-width = "0.1"          # Display width calculation
+
+# Performance
+ahash = "0.8"           # Fast hashing for internal maps
+bumpalo = "3.13"        # Arena allocation for AST nodes
+
+# Numeric handling
+lexical = "6.1"         # Fast number parsing
+ryu = "1.0"            # Fast float-to-string conversion
+
+[dev-dependencies]
+# Testing
+quickcheck = "1.0"      # Property-based testing
+proptest = "1.2"        # Advanced property testing
+criterion = "0.5"       # Benchmarking framework
+insta = "1.31"         # Snapshot testing for parsers
+
+# Debugging
+pretty_assertions = "1.4"  # Better assertion output
+env_logger = "0.10"       # Logging for tests
